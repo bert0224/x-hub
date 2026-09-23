@@ -71,13 +71,9 @@ const dailyTime = shallowRef<TimeValue>(new Time(15, 0))
 const formError = ref('')
 const nameInputRef = ref<HTMLInputElement | null>(null)
 
-const activeCountdowns = computed(() =>
-  store.state.countdowns
-    .filter((c) => !c.finished)
-    .sort((a, b) => a.end_at - b.end_at),
-)
-const finishedCountdowns = computed(() =>
-  store.state.countdowns.filter((c) => c.finished),
+// 统一列表：已结束的不单独分区，按到点时间与进行中混排（结束时只变状态、不挪位置）
+const sortedCountdowns = computed(() =>
+  [...store.state.countdowns].sort((a, b) => a.end_at - b.end_at || b.id - a.id),
 )
 
 // ---- 每秒刷新剩余时间 ----
@@ -272,78 +268,76 @@ async function onToggleFloat(c: Countdown) {
       </button>
     </header>
 
-    <!-- 进行中列表 -->
-    <div v-if="activeCountdowns.length > 0" class="cc-list">
+    <!-- 倒计时列表：已结束的仍在列表中按到点时间占原位，只是状态不同（灰态） -->
+    <div v-if="sortedCountdowns.length > 0" class="cc-list">
       <div
-        v-for="c in activeCountdowns"
+        v-for="c in sortedCountdowns"
         :key="c.id"
         class="cc-item"
-        :class="{ paused: c.paused }"
+        :class="{ paused: c.paused && !c.finished, finished: c.finished }"
       >
-        <div class="cc-mode-icon" :class="c.repeat_mode" :title="MODE_LABEL[c.repeat_mode]">
-          <component :is="MODE_ICON[c.repeat_mode] || Timer" :size="15" :stroke-width="2" aria-hidden="true" />
-        </div>
-        <div class="cc-main">
-          <div class="cc-item-top">
-            <span class="cc-item-name" :title="c.name">{{ c.name }}</span>
-            <span class="cc-badge" :class="c.repeat_mode">{{ MODE_LABEL[c.repeat_mode] }}</span>
+        <template v-if="c.finished">
+          <div class="cc-mode-icon finished" title="已结束">
+            <CheckCircle2 :size="15" :stroke-width="2" aria-hidden="true" />
           </div>
-          <div class="cc-item-meta">
-            <span class="cc-remaining" :title="remainingLabel(c)">{{ remainingLabel(c) }}</span>
-            <span class="cc-due" :title="dueLabel(c)">{{ dueLabel(c) }}</span>
+          <div class="cc-main">
+            <div class="cc-item-top">
+              <span class="cc-item-name muted" :title="c.name">{{ c.name }}</span>
+              <span class="cc-badge once">已结束</span>
+            </div>
+            <div class="cc-item-meta">
+              <span class="cc-remaining muted">00:00</span>
+            </div>
           </div>
-        </div>
-        <div class="cc-actions">
-          <button
-            class="cc-btn"
-            :class="{ active: c.paused }"
-            :title="c.paused ? '恢复' : '暂停'"
-            type="button"
-            @click="onTogglePause(c)"
-          >
-            <Play v-if="c.paused" :size="13" :stroke-width="2" />
-            <Pause v-else :size="13" :stroke-width="2" />
-          </button>
-          <button
-            class="cc-btn cc-float"
-            :class="{ active: c.floated }"
-            :title="c.floated ? '收起浮窗' : '浮窗显示'"
-            type="button"
-            @click="onToggleFloat(c)"
-          >
-            <PanelTopClose :size="13" :stroke-width="2" />
-          </button>
-          <button class="cc-btn cc-del" title="删除" type="button" @click="onDelete(c)">
-            <Trash2 :size="13" :stroke-width="2" />
-          </button>
-        </div>
+          <div class="cc-actions">
+            <button class="cc-btn cc-del" title="删除" type="button" @click="onDelete(c)">
+              <Trash2 :size="13" :stroke-width="2" />
+            </button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="cc-mode-icon" :class="c.repeat_mode" :title="MODE_LABEL[c.repeat_mode]">
+            <component :is="MODE_ICON[c.repeat_mode] || Timer" :size="15" :stroke-width="2" aria-hidden="true" />
+          </div>
+          <div class="cc-main">
+            <div class="cc-item-top">
+              <span class="cc-item-name" :title="c.name">{{ c.name }}</span>
+              <span class="cc-badge" :class="c.repeat_mode">{{ MODE_LABEL[c.repeat_mode] }}</span>
+            </div>
+            <div class="cc-item-meta">
+              <span class="cc-remaining" :title="remainingLabel(c)">{{ remainingLabel(c) }}</span>
+              <span class="cc-due" :title="dueLabel(c)">{{ dueLabel(c) }}</span>
+            </div>
+          </div>
+          <div class="cc-actions">
+            <button
+              class="cc-btn"
+              :class="{ active: c.paused }"
+              :title="c.paused ? '恢复' : '暂停'"
+              type="button"
+              @click="onTogglePause(c)"
+            >
+              <Play v-if="c.paused" :size="13" :stroke-width="2" />
+              <Pause v-else :size="13" :stroke-width="2" />
+            </button>
+            <button
+              class="cc-btn cc-float"
+              :class="{ active: c.floated }"
+              :title="c.floated ? '收起浮窗' : '浮窗显示'"
+              type="button"
+              @click="onToggleFloat(c)"
+            >
+              <PanelTopClose :size="13" :stroke-width="2" />
+            </button>
+            <button class="cc-btn cc-del" title="删除" type="button" @click="onDelete(c)">
+              <Trash2 :size="13" :stroke-width="2" />
+            </button>
+          </div>
+        </template>
       </div>
     </div>
 
-    <!-- 已结束灰态 -->
-    <div v-if="finishedCountdowns.length > 0" class="cc-finished">
-      <div v-for="c in finishedCountdowns" :key="c.id" class="cc-item finished">
-        <div class="cc-mode-icon finished" title="已结束">
-          <CheckCircle2 :size="15" :stroke-width="2" aria-hidden="true" />
-        </div>
-        <div class="cc-main">
-          <div class="cc-item-top">
-            <span class="cc-item-name muted" :title="c.name">{{ c.name }}</span>
-            <span class="cc-badge once">已结束</span>
-          </div>
-          <div class="cc-item-meta">
-            <span class="cc-remaining muted">00:00</span>
-          </div>
-        </div>
-        <div class="cc-actions">
-          <button class="cc-btn cc-del" title="删除" type="button" @click="onDelete(c)">
-            <Trash2 :size="13" :stroke-width="2" />
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="activeCountdowns.length === 0 && finishedCountdowns.length === 0 && !creating" class="cc-empty">
+    <div v-if="sortedCountdowns.length === 0 && !creating" class="cc-empty">
       <Clock :size="16" :stroke-width="2" aria-hidden="true" />
       <p>还没有倒计时</p>
       <p class="cc-empty-sub">点「新建」添加一个，支持时长 / 定时 / 每天 / 间隔，最多 {{ MAX_COUNTDOWNS }} 个</p>
@@ -733,9 +727,8 @@ async function onToggleFloat(c: Countdown) {
 }
 
 /* 列表：两列自适应行数（上限 6 个 = 3 行），每行最小 48px 保证条目内容完整（icon 32 + padding 8×2），
-   行数随条目数量变化，不存在空行占位；不因已结束区块而把行高压扁导致内容裁切。
-   列表高度随内容自适应（不撑满剩余空间），使紧邻的已结束区块跟随在下方，
-   多余高度留在卡片底部，避免「进行中」与「已结束」两行之间被拉开一大段空白。 */
+   行数随条目数量变化，不存在空行占位；已结束条目仍在同一列表内按到点时间占原位，只是灰态显示。
+   列表高度随内容自适应（不撑满剩余空间），多余高度留在卡片底部。 */
 .cc-list {
   /* flex: 0 1 auto = 内容自适应（不撑满剩余空间，多余高度留在卡片底部），但允许被压缩：
      格子太矮时收缩并出滚动条（滚动兜底），而不是溢出后被卡片 overflow:hidden 裁掉。 */
@@ -767,6 +760,9 @@ async function onToggleFloat(c: Countdown) {
 }
 .cc-item.paused {
   opacity: 0.62;
+}
+.cc-item.finished {
+  opacity: 0.7;
 }
 .cc-mode-icon {
   flex-shrink: 0;
@@ -923,17 +919,6 @@ async function onToggleFloat(c: Countdown) {
   color: var(--text-on-accent);
 }
 
-/* 已结束灰态：底部区块，与上方列表行间距保持一致（8px）
-   （若与 .cc-list 同为 flex:1，二者各占一半 → 主列表行高减半、条目挤压溢出） */
-.cc-finished {
-  flex: 0 0 auto;
-  margin-top: 8px;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-auto-rows: minmax(48px, auto);
-  gap: 8px;
-}
-
 /* 矮格子紧凑档（容器查询，基准是 .dash-cell / 编辑器的 .le-cell）：
    行高、图标、间距收紧并隐藏「到点时刻」这类次要信息，同样高度多放一条；
    再放不下就由 .cc-list 滚动兜底 —— 任何格子尺寸下都不会静默裁掉内容。 */
@@ -943,7 +928,6 @@ async function onToggleFloat(c: Countdown) {
   .cc-mode-icon { width: 26px; height: 26px; }
   .cc-item-name { font-size: 0.75rem; }
   .cc-due { display: none; }
-  .cc-finished { grid-auto-rows: minmax(40px, auto); gap: 6px; }
   /* 空态在极矮格子里只留主文案，副说明与图标让位（否则会把格子撑破） */
   .cc-empty { gap: 4px; }
   .cc-empty-sub { display: none; }

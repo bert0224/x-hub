@@ -377,7 +377,7 @@ const kind = computed(() => {
           v-for="c in countdownList"
           :key="c.id"
           class="cc-item"
-          :class="{ paused: c.paused }"
+          :class="{ paused: c.paused && !c.finished, finished: c.finished }"
         >
           <div class="cc-mode" :class="c.repeat_mode">
             <component :is="MODE_ICON[c.repeat_mode] || Timer" class="ic-md" />
@@ -385,10 +385,10 @@ const kind = computed(() => {
           <div class="cc-main">
             <div class="cc-top">
               <span class="cc-name">{{ c.name }}</span>
-              <span class="cc-badge" :class="c.repeat_mode">{{ MODE_LABEL[c.repeat_mode] ?? '一次性' }}</span>
+              <span class="cc-badge" :class="c.repeat_mode">{{ c.finished ? '已结束' : (MODE_LABEL[c.repeat_mode] ?? '一次性') }}</span>
             </div>
             <div class="cc-meta">
-              <span class="cc-remaining">{{ fmtRemain(c) }}</span>
+              <span class="cc-remaining">{{ c.finished ? '00:00' : fmtRemain(c) }}</span>
               <span class="cc-due">{{ c.repeat_mode === 'daily' ? '每天' : c.repeat_mode === 'interval' ? `每 ${c.interval_minutes ?? 0} 分钟` : '' }}</span>
             </div>
           </div>
@@ -1210,6 +1210,9 @@ html[data-theme='dark'] .dpv {
 }
 .cc-item.paused {
   opacity: 0.62;
+}
+.cc-item.finished {
+  opacity: 0.7;
 }
 .cc-mode {
   width: calc(32 * var(--u));

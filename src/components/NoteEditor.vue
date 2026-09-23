@@ -1,24 +1,34 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { Crepe } from '@milkdown/crepe'
 import '@milkdown/crepe/theme/common/style.css'
 import '@milkdown/crepe/theme/frame.css'
 import { editorViewCtx } from '@milkdown/kit/core'
-import type { Node as ProseNode } from '@milkdown/kit/prose/model'
+import type { Ctx } from '@milkdown/kit/ctx'
+import { imageBlockSchema } from '@milkdown/kit/component/image-block'
+import { codeBlockSchema } from '@milkdown/kit/preset/commonmark'
+import { createTable } from '@milkdown/kit/preset/gfm'
+import { Fragment, type Node as ProseNode, type Schema } from '@milkdown/kit/prose/model'
 import type { EditorView } from '@milkdown/kit/prose/view'
-import { TextSelection, type EditorState } from '@milkdown/kit/prose/state'
+import { NodeSelection, TextSelection, type EditorState } from '@milkdown/kit/prose/state'
 import { Tag as TagIcon, Trash2, X } from 'lucide-vue-next'
 import { isTauri, tauriApi, type Note, type Tag } from '../api/tauri'
 import { useStore } from '../stores/workbench'
 import { attachBlockDrag } from '../utils/blockDrag'
+import { expandOnEnter, matchWysiwygLine, type LineShortcut } from '../utils/markdownEnter'
+import { loosenHtmlBreaks, renderNoteMarkdown, restoreCrepeMarkdown } from '../utils/markdownHtml'
 import { deriveNoteTitle } from '../utils/markdown'
+import { NOTE_EDITOR_MODES, normalizeNoteEditorMode, type NoteEditorMode } from '../utils/noteEditorMode'
 import { getQuickEmojis } from '../utils/emoji'
 import { saveNoteImageFile } from '../utils/noteImage'
 import { parseTimestamp } from '../utils/time'
 import EmojiPicker from './EmojiPicker.vue'
 
 /**
- * 速记编辑器：Milkdown Crepe 所见即所得（Markdown 为真相源，序列化结果经 600ms 防抖落盘）。
+ * 速记编辑器：实时预览（Crepe 所见即所得）/ 分屏预览 / 源码。Markdown 为真相源，600ms 防抖落盘。
+ * 模式记在配置 note_editor_mode，按用户记住，不按笔记。
+ * 行尾回车补结构（三种模式同一套判断）：``` / $$ 闭合，未写完的图片补成 ![]()，
+ * |列x行| 或表头行生成表格。实时预览里回车同样把 #、>、-、1.、---、- [ ]、- [x] 收成标题、引用、列表、分隔线和任务。
  * 图片（粘贴/拖拽/点击上传）统一由 Crepe 的上传管线处理：plugin-upload 的 handlePaste/
  * handleDrop + ImageBlock 的 onUpload 配置 → saveNoteImageFile（notes/images + xhub-note 协议）。
  * 注意勿再自建 DOM paste 监听——plugin-upload 已处理粘贴，叠加监听会导致图片重复插入。
@@ -36,9 +46,16 @@ const emit = defineEmits<{
 
 const store = useStore()
 
+const mode = ref<NoteEditorMode>(normalizeNoteEditorMode(store.state.config.note_editor_mode))
+
 const rootEl = ref<HTMLDivElement>()
+const splitSourceEl = ref<HTMLTextAreaElement | null>(null)
+const previewEl = ref<HTMLDivElement | null>(null)
+let splitResize: ResizeObserver | null = null
 
 let crepe: Crepe | null = null
+/** 当前 Crepe 挂在哪一个容器上。容器被换掉（v-if 重建）时必须重挂，不能只看 crepe 是否非空。 */
+let mountedOn: HTMLElement | null = null
 let mounting = false
 /** 挂载期间又切换了笔记：完成后需按最新笔记重挂一次（否则编辑器停留旧内容、防抖保存会跨笔记污染） */
 let remountQueued = false
@@ -47,6 +64,7 @@ let detachBlockDrag: (() => void) | null = null
 const localTitle = ref('')
 const localContent = ref('')
 const dirty = ref(false)
+const previewHtml = computed(() => renderNoteMarkdown(localContent.value))
 
 // ---- 生命周期 ----
 onBeforeUnmount(() => {
@@ -57,6 +75,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerup', onResizeUp)
   resizeCtx = null
   window.removeEventListener('keydown', onPreviewKeydown)
+  splitResize?.disconnect()
+  splitResize = null
   void destroyEditor()
 })
 
@@ -65,6 +85,7 @@ async function destroyEditor() {
   detachBlockDrag = null
   const c = crepe
   crepe = null
+  mountedOn = null
   if (c) {
     try {
       await c.destroy()
@@ -79,6 +100,7 @@ async function mountEditor(content: string) {
   if (!rootEl.value) return
   if (mounting) {
     // Crepe 异步初始化期间再次切换笔记时不能静默吞掉挂载请求——记下重挂，本次完成后按最新笔记重来
+    queuedMarkdown = content
     remountQueued = true
     return
   }
@@ -88,7 +110,7 @@ async function mountEditor(content: string) {
     await destroyEditor()
     const c = new Crepe({
       root: rootEl.value,
-      defaultValue: content,
+      defaultValue: loosenHtmlBreaks(content),
       // AI 特性需外部模型服务，保持纯本地
       features: { [Crepe.Feature.AI]: false },
       featureConfigs: {
@@ -190,6 +212,7 @@ async function mountEditor(content: string) {
       })
     })
     crepe = c
+    mountedOn = rootEl.value
     attachImageListeners()
     // 块拖拽（六点把手）指针实现：create 完成后从 ctx 取 EditorView 接管把手拖拽
     c.editor.action((ctx) => {
@@ -202,9 +225,14 @@ async function mountEditor(content: string) {
     console.error('Crepe 初始化失败', e)
   } finally {
     mounting = false
-    if (remountQueued && props.note && rootEl.value) {
+    if (remountQueued && props.note && rootEl.value && mode.value === 'wysiwyg') {
       remountQueued = false
-      void mountEditor(props.note.content ?? '')
+      const next = queuedMarkdown ?? content
+      queuedMarkdown = null
+      void mountEditor(next)
+    } else {
+      remountQueued = false
+      queuedMarkdown = null
     }
   }
 }
@@ -213,25 +241,46 @@ async function mountEditor(content: string) {
 // 定时器与标签状态声明必须在 watch 之前：immediate 回调在 setup 阶段同步执行，后置声明会触发 TDZ
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let lastNoteId: number | null = null
+/** 挂载进行中又收到新内容时，结束后按这份 Markdown 重挂，避免用过期的笔记正文 */
+let queuedMarkdown: string | null = null
 const noteTags = ref<Tag[]>([])
 const tagInputVisible = ref(false)
 const tagInput = ref('')
 
-// 同时观察 rootEl：immediate 在 setup 阶段触发时模板尚未渲染（rootEl 为空），
-// flush:'post' 保证组件渲染出编辑器容器后再执行挂载
+// 必须同时观察 rootEl：Crepe 容器在 setup 阶段还没渲染，只盯笔记 id 时首次挂载会落空（约定 38 时序陷阱①）。
+// flush:'post' 等本次渲染把容器交出来；容器晚一拍出现时，rootEl 变化会再进一次回调。
 watch(
   [() => props.note?.id, rootEl],
-  async ([, el]) => {
-    if (!props.note || !el) {
-      flushPendingSave()
-      void destroyEditor()
+  async ([id, el], prev) => {
+    const prevId = prev?.[0]
+    // 回调触发时 props.note 已是新笔记，Crepe 里仍是上一篇。先取出上一篇正文再落盘，避免写到新笔记上。
+    if (typeof prevId === 'number' && prevId !== id) {
+      if (mode.value === 'wysiwyg') {
+        const captured = captureCrepeMarkdown()
+        const restored = captured == null ? null : restoreCrepeMarkdown(captured)
+        if (restored != null && restored !== localContent.value) {
+          localContent.value = restored
+          deriveTitleFromContent(restored)
+          dirty.value = true
+        }
+      }
+      flushLeavingNote(prevId)
+    }
+    if (!props.note) {
+      await destroyEditor()
       syncLocal()
       noteTags.value = []
       return
     }
-    syncLocal()
-    void mountEditor(props.note.content ?? '')
-    // 加载笔记标签
+    const noteChanged = prevId !== id
+    if (noteChanged) syncLocal()
+    if (mode.value === 'wysiwyg') {
+      // 源码/分屏没有这块容器。el 为空就等下一次 rootEl 赋值，不能当成「笔记没了」去清正文。
+      if (el && (noteChanged || !crepe || mountedOn !== el)) void mountEditor(localContent.value)
+    } else if (noteChanged) {
+      await destroyEditor()
+    }
+    if (!noteChanged || !props.note || props.note.id !== id) return
     if (isTauri()) {
       noteTags.value = await tauriApi.getNoteTags(props.note.id)
     } else {
@@ -239,6 +288,18 @@ watch(
     }
   },
   { immediate: true, flush: 'post' },
+)
+
+watch(
+  () => store.state.config.note_editor_mode,
+  (value) => {
+    const next = normalizeNoteEditorMode(value)
+    if (value !== next) {
+      void store.setNoteEditorMode(next)
+      return
+    }
+    if (next !== mode.value) void applyMode(next, false)
+  },
 )
 
 function syncLocal() {
@@ -265,16 +326,320 @@ function normalizeTitle(title: string): string {
 }
 
 function onEdited(markdown: string) {
-  if (!props.note) return
-  localContent.value = markdown
-  // 标题还是默认值时，从正文首行（标题行/前几个字）自动派生；用户一旦改过标题即不再接管
-  if (localTitle.value === '' || localTitle.value === '无标题笔记') {
-    const derived = deriveNoteTitle(markdown)
-    if (derived) localTitle.value = derived
-  }
+  if (!props.note || mode.value !== 'wysiwyg') return
+  // Crepe 序列化会加上 \[ \* 并把列表/分隔线改写成星号。收回来再存，切到分屏才和实时预览一致。
+  adoptMarkdown(restoreCrepeMarkdown(markdown))
   // ratio 等图片属性可能经撤销/属性事务变化，同步一次宽度（幂等、无强制布局）
   syncImageWidths()
+}
+
+/** 把一份 Markdown 收进当前笔记。内容没变就不重新排保存。 */
+function adoptMarkdown(markdown: string) {
+  if (!props.note || markdown === localContent.value) return
+  localContent.value = markdown
+  deriveTitleFromContent(markdown)
   scheduleSave()
+}
+
+/** 标题还是默认值时，从正文首行自动派生；用户一旦改过标题即不再接管 */
+function deriveTitleFromContent(markdown: string) {
+  if (localTitle.value !== '' && localTitle.value !== '无标题笔记') return
+  const derived = deriveNoteTitle(markdown)
+  if (derived) localTitle.value = derived
+}
+
+function captureCrepeMarkdown(): string | null {
+  const c = crepe
+  if (!c) return null
+  try {
+    return c.getMarkdown()
+  } catch (e) {
+    console.warn('读取编辑器 Markdown 失败', e)
+    return null
+  }
+}
+
+/** 离开当前笔记时立刻落盘。id 用离开前的那篇，不能用已经换上来的 props.note。 */
+function flushLeavingNote(id: number) {
+  if (saveTimer) {
+    clearTimeout(saveTimer)
+    saveTimer = null
+  }
+  if (!dirty.value) return
+  dirty.value = false
+  emit('save', id, normalizeTitle(localTitle.value), localContent.value)
+}
+
+function onSourceInput(e: Event) {
+  const value = (e.target as HTMLTextAreaElement).value
+  adoptMarkdown(value)
+  if (mode.value === 'split') void nextTick(syncPreviewScroll)
+}
+
+/** 分屏时右边预览按左边源码的滚动比例跟着走。两边高度不同，对齐的是滚动条位置而不是某一行。 */
+function syncPreviewScroll() {
+  const source = splitSourceEl.value
+  const preview = previewEl.value
+  if (!source || !preview) return
+  const sourceMax = source.scrollHeight - source.clientHeight
+  const previewMax = preview.scrollHeight - preview.clientHeight
+  preview.scrollTop = sourceMax <= 0 || previewMax <= 0 ? 0 : (source.scrollTop / sourceMax) * previewMax
+}
+
+watch([splitSourceEl, previewEl], () => {
+  splitResize?.disconnect()
+  splitResize = null
+  const source = splitSourceEl.value
+  const preview = previewEl.value
+  if (!source || !preview) return
+  splitResize = new ResizeObserver(() => syncPreviewScroll())
+  splitResize.observe(source)
+  splitResize.observe(preview)
+  syncPreviewScroll()
+})
+
+/** 行尾回车补上代码块、公式、图片、表格。光标留在新结构里。 */
+function onSourceKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.defaultPrevented) return
+  const el = e.target
+  if (!(el instanceof HTMLTextAreaElement) || el.selectionStart !== el.selectionEnd) return
+  const expanded = expandOnEnter(el.value, el.selectionStart)
+  if (!expanded) return
+  e.preventDefault()
+  adoptMarkdown(expanded.value)
+  void nextTick(() => {
+    el.setSelectionRange(expanded.cursor, expanded.cursor)
+    if (mode.value === 'split') syncPreviewScroll()
+  })
+}
+
+/**
+ * 实时预览里 Milkdown 要在标记后面加空格才变成对应节点，单独回车只是换行。
+ * 捕获阶段接住回车，把整行快捷标记换成代码块、公式块、图片块、表格、标题、引用、列表或分隔线。
+ */
+function onCrepeKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || !crepe) return
+  const target = e.target
+  if (target instanceof HTMLElement && target.closest('input, textarea, .milkdown-slash-menu')) return
+  let handled = false
+  crepe.editor.action((ctx) => {
+    const view = ctx.get(editorViewCtx)
+    const { state } = view
+    const { $from, empty } = state.selection
+    // 第三个 `-` 会被 Milkdown 的输入规则收成分隔线，并选中这条线。
+    // 这时默认回车会在线的上方再插一段（线是父节点第一个子节点时），光标回到「开始记录…」，看起来像没转成。
+    if (!empty) {
+      const selected = state.selection
+      if (!(selected instanceof NodeSelection) || selected.node.type.name !== 'hr') return
+      const paragraph = state.schema.nodes.paragraph
+      if (!paragraph) return
+      const after = selected.to
+      let tr = state.tr
+      const next = state.doc.resolve(after).nodeAfter
+      if (!next || !next.isTextblock) tr = tr.insert(after, paragraph.create())
+      const sel = TextSelection.findFrom(tr.doc.resolve(Math.min(after + 1, tr.doc.content.size)), 1, true)
+      if (!sel) return
+      view.dispatch(tr.setSelection(sel).scrollIntoView())
+      view.focus()
+      handled = true
+      return
+    }
+    const parent = $from.parent
+    if (!parent.isTextblock || parent.type.spec.code) return
+    // 光标不在行尾时回车只是拆行，不能把整行快捷标记换掉
+    if ($from.parentOffset !== parent.content.size) return
+    const shortcut = matchWysiwygLine(parent.textContent)
+    if (!shortcut) return
+    const start = $from.before()
+    const end = $from.after()
+    if (shortcut.type === 'code' || shortcut.type === 'math') {
+      const codeBlock = codeBlockSchema.type(ctx)
+      if (!$from.node(-1).canReplaceWith($from.index(-1), $from.indexAfter(-1), codeBlock)) return
+      const tr = state.tr.delete($from.start(), $from.end()).setBlockType($from.start(), $from.start(), codeBlock, {
+        language: shortcut.type === 'math' ? 'LaTeX' : shortcut.language,
+      })
+      view.dispatch(tr.scrollIntoView())
+      view.focus()
+      handled = true
+      return
+    }
+    if (shortcut.type === 'heading') {
+      const heading = state.schema.nodes.heading
+      if (!heading) return
+      if (!$from.node(-1).canReplaceWith($from.index(-1), $from.indexAfter(-1), heading)) return
+      const from = $from.start()
+      const to = Math.min(from + shortcut.prefix, $from.end())
+      let tr = state.tr
+      if (to > from) tr = tr.delete(from, to)
+      const pos = tr.mapping.map(from)
+      tr = tr.setBlockType(pos, pos, heading, { level: shortcut.level })
+      view.dispatch(tr.scrollIntoView())
+      view.focus()
+      handled = true
+      return
+    }
+    if (shortcut.type === 'task') {
+      const itemDepth = listItemDepth($from)
+      if (itemDepth > 0) {
+        const item = $from.node(itemDepth)
+        if (!item.type.spec.attrs || !('checked' in item.type.spec.attrs)) return
+        const from = $from.start()
+        const to = Math.min(from + shortcut.prefix, $from.end())
+        let tr = state.tr
+        if (to > from) tr = tr.delete(from, to)
+        const pos = tr.mapping.map($from.before(itemDepth))
+        tr = tr.setNodeMarkup(pos, undefined, { ...item.attrs, checked: shortcut.checked })
+        view.dispatch(tr.scrollIntoView())
+        view.focus()
+        handled = true
+        return
+      }
+    }
+    if (shortcut.type === 'hr') {
+      const hrType = state.schema.nodes.hr ?? state.schema.nodes.horizontal_rule
+      const paragraph = state.schema.nodes.paragraph
+      if (!hrType || !paragraph) return
+      const hr = hrType.create()
+      const blank = paragraph.create()
+      const fragment = Fragment.from([hr, blank])
+      if (!$from.node(-1).canReplace($from.index(-1), $from.indexAfter(-1), fragment)) return
+      let tr = state.tr.replaceWith(start, end, fragment)
+      const sel = TextSelection.findFrom(tr.doc.resolve(Math.min(start + hr.nodeSize + 1, tr.doc.content.size)), 1, true)
+      if (sel) tr = tr.setSelection(sel)
+      view.dispatch(tr.scrollIntoView())
+      view.focus()
+      handled = true
+      return
+    }
+    let node: ProseNode | null = null
+    try {
+      node = shortcutNode(ctx, state.schema, shortcut)
+    } catch (err) {
+      console.warn('快捷结构生成失败', err)
+      return
+    }
+    if (!node) return
+    if (!$from.node(-1).canReplaceWith($from.index(-1), $from.indexAfter(-1), node.type)) return
+    let tr = state.tr.replaceWith(start, end, node)
+    const cursor = cursorInShortcut(tr.doc, start, node.nodeSize, shortcut.type)
+    if (cursor != null) {
+      const sel = TextSelection.findFrom(tr.doc.resolve(cursor), 1, true)
+      if (sel) tr = tr.setSelection(sel)
+    }
+    view.dispatch(tr.scrollIntoView())
+    view.focus()
+    handled = true
+  })
+  if (!handled) return
+  e.preventDefault()
+  e.stopPropagation()
+}
+
+function shortcutNode(ctx: Ctx, schema: Schema, shortcut: LineShortcut): ProseNode | null {
+  if (shortcut.type === 'image') {
+    return imageBlockSchema.type(ctx).create({
+      src: shortcut.src,
+      caption: shortcut.caption,
+      ratio: 1,
+    })
+  }
+  if (shortcut.type === 'table-size') return createTable(ctx, shortcut.rows, shortcut.cols)
+  if (shortcut.type === 'table-row') return tableFromCells(schema, shortcut.cells)
+  if (shortcut.type === 'blockquote' || shortcut.type === 'bullet' || shortcut.type === 'ordered' || shortcut.type === 'task') {
+    return wrappedBlock(schema, shortcut)
+  }
+  return null
+}
+
+function wrappedBlock(
+  schema: Schema,
+  shortcut: Extract<LineShortcut, { type: 'blockquote' | 'bullet' | 'ordered' | 'task' }>,
+): ProseNode | null {
+  const paragraph = schema.nodes.paragraph
+  if (!paragraph) return null
+  const inner = shortcut.text ? paragraph.create(null, schema.text(shortcut.text)) : paragraph.create()
+  if (shortcut.type === 'blockquote') {
+    const quote = schema.nodes.blockquote
+    return quote ? quote.create(null, inner) : null
+  }
+  const itemType = schema.nodes.list_item
+  if (!itemType) return null
+  const attrs: Record<string, unknown> = {}
+  if (shortcut.type === 'ordered') {
+    attrs.listType = 'ordered'
+    attrs.label = `${shortcut.order}.`
+  }
+  if (shortcut.type === 'task') {
+    if (!itemType.spec.attrs || !('checked' in itemType.spec.attrs)) return null
+    attrs.checked = shortcut.checked
+    attrs.listType = 'bullet'
+    attrs.label = '•'
+  }
+  const item = itemType.create(attrs, inner)
+  if (shortcut.type === 'ordered') {
+    const list = schema.nodes.ordered_list
+    return list ? list.create({ order: shortcut.order }, item) : null
+  }
+  const list = schema.nodes.bullet_list
+  return list ? list.create(null, item) : null
+}
+
+function listItemDepth($from: EditorState['selection']['$from']): number {
+  for (let depth = $from.depth; depth > 0; depth--) {
+    if ($from.node(depth).type.name === 'list_item') return depth
+  }
+  return -1
+}
+
+function tableFromCells(schema: Schema, cells: string[]): ProseNode | null {
+  const table = schema.nodes.table
+  const headerRow = schema.nodes.table_header_row
+  const header = schema.nodes.table_header
+  const row = schema.nodes.table_row
+  const cell = schema.nodes.table_cell
+  const paragraph = schema.nodes.paragraph
+  if (!table || !headerRow || !header || !row || !cell || !paragraph) return null
+  const headerCells = cells.map((text) =>
+    header.create(null, text ? paragraph.create(null, schema.text(text)) : paragraph.create()),
+  )
+  const bodyCells = cells.map(() => cell.createAndFill())
+  if (bodyCells.some((item) => !item)) return null
+  return table.create(null, [
+    headerRow.create(null, headerCells),
+    row.create(null, bodyCells as ProseNode[]),
+  ])
+}
+
+/** 表格表头行的光标落到第一个数据格，其余落到新节点内部。 */
+function cursorInShortcut(doc: ProseNode, start: number, size: number, type: LineShortcut['type']): number | null {
+  if (type !== 'table-row') return Math.min(start + 1, doc.content.size)
+  let cellPos: number | null = null
+  doc.nodesBetween(start, Math.min(start + size, doc.content.size), (node, pos) => {
+    if (cellPos != null) return false
+    if (node.type.name === 'table_cell') {
+      cellPos = pos + 1
+      return false
+    }
+  })
+  return cellPos
+}
+
+async function applyMode(next: NoteEditorMode, persist: boolean) {
+  if (next === mode.value) return
+  if (mode.value === 'wysiwyg') {
+    const captured = captureCrepeMarkdown()
+    if (captured != null) adoptMarkdown(restoreCrepeMarkdown(captured))
+  }
+  mode.value = next
+  if (persist) void store.setNoteEditorMode(next)
+  if (next !== 'wysiwyg') await destroyEditor()
+  // 切回实时预览时容器会重新出现，上面的 rootEl watch 负责挂载
+}
+
+function onPreviewClick(e: MouseEvent) {
+  const target = e.target
+  if (!(target instanceof HTMLImageElement) || !target.src) return
+  previewSrc.value = target.currentSrc || target.src
 }
 
 /** 标题输入（v-model 之外）：用户修改标题必须同样进入防抖保存链路，
@@ -301,10 +666,12 @@ function attachImageListeners() {
   root.addEventListener('load', onEditorImgLoad, true)
   root.addEventListener('click', onEditorClick)
   root.addEventListener('pointerdown', onEditorPointerDown, true)
+  root.addEventListener('keydown', onCrepeKeydown, true)
   detachImageListeners = () => {
     root.removeEventListener('load', onEditorImgLoad, true)
     root.removeEventListener('click', onEditorClick)
     root.removeEventListener('pointerdown', onEditorPointerDown, true)
+    root.removeEventListener('keydown', onCrepeKeydown, true)
     detachImageListeners = () => {}
   }
 }
@@ -630,6 +997,19 @@ function onEditorAreaMouseDown(e: MouseEvent) {
           @input="onTitleInput"
           @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
         />
+        <div class="mode-switch" role="radiogroup" aria-label="编辑模式">
+          <button
+            v-for="item in NOTE_EDITOR_MODES"
+            :key="item.id"
+            type="button"
+            role="radio"
+            :aria-checked="mode === item.id"
+            :class="{ on: mode === item.id }"
+            @click="applyMode(item.id, true)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
         <button
           class="icon-btn del"
           title="删除笔记"
@@ -640,7 +1020,39 @@ function onEditorAreaMouseDown(e: MouseEvent) {
         </button>
       </header>
 
-      <div ref="rootEl" class="crepe-root" @mousedown.capture="onEditorAreaMouseDown"></div>
+      <div v-if="mode === 'wysiwyg'" ref="rootEl" class="crepe-root" @mousedown.capture="onEditorAreaMouseDown"></div>
+      <textarea
+        v-else-if="mode === 'source'"
+        class="md-source"
+        :value="localContent"
+        spellcheck="false"
+        placeholder="开始记录…"
+        aria-label="Markdown 源码"
+        @input="onSourceInput"
+        @keydown="onSourceKeydown"
+      />
+      <div v-else class="ed-split">
+        <textarea
+          ref="splitSourceEl"
+          class="md-source"
+          :value="localContent"
+          spellcheck="false"
+          placeholder="开始记录…"
+          aria-label="Markdown 源码"
+          @input="onSourceInput"
+          @keydown="onSourceKeydown"
+          @scroll="syncPreviewScroll"
+        />
+        <div
+          v-if="localContent.trim()"
+          ref="previewEl"
+          class="md-preview"
+          aria-label="预览"
+          v-html="previewHtml"
+          @click="onPreviewClick"
+        />
+        <p v-else class="md-preview md-preview-empty">开始记录…</p>
+      </div>
 
       <!-- 底栏：左标签行 + 右保存状态 -->
       <footer class="ed-footer">
@@ -720,6 +1132,7 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   flex-direction: column;
   padding: 12px 16px 10px;
   overflow: hidden;
+  container-type: inline-size;
   /* 速记模块字号：全局基准 × 模块系数 */
   font-size: calc(1rem * var(--fs-notes, 1));
 }
@@ -774,6 +1187,7 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 
 .crepe-root {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--border-soft);
@@ -783,7 +1197,185 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 
 .crepe-root :deep(.milkdown) {
   height: 100%;
+  min-width: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+}
+
+.mode-switch {
+  display: flex;
+  flex-shrink: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--input-bg);
+}
+
+.mode-switch button {
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font: inherit;
+  font-size: 0.75em;
+  line-height: 1.2;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.mode-switch button.on {
+  background: var(--brand-50);
+  color: var(--brand-500);
+}
+
+.mode-switch button:hover {
+  color: var(--text-1);
+}
+
+.md-source {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  border: 1px solid var(--border-soft);
+  background: var(--input-bg);
+  border-radius: var(--radius-md);
+  color: var(--text-1);
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 0.875em;
+  line-height: 1.6;
+  padding: 12px 14px;
+  outline: none;
+}
+
+.md-source:focus {
+  border-color: var(--brand-500);
+  box-shadow: var(--shadow-focus);
+}
+
+.ed-split {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.md-preview {
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border-soft);
+  background: var(--input-bg);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  color: var(--text-1);
+  line-height: 1.6;
+}
+
+.md-preview-empty {
+  margin: 0;
+  color: var(--text-4);
+}
+
+.md-preview :deep(p),
+.md-preview :deep(ul),
+.md-preview :deep(ol),
+.md-preview :deep(pre),
+.md-preview :deep(blockquote) {
+  margin: 0 0 0.6em;
+}
+
+.md-preview :deep(input[type='checkbox']) {
+  margin: 0 6px 0 0;
+  accent-color: var(--brand-500);
+  vertical-align: -2px;
+}
+
+.md-preview :deep(h1),
+.md-preview :deep(h2),
+.md-preview :deep(h3),
+.md-preview :deep(h4),
+.md-preview :deep(h5),
+.md-preview :deep(h6) {
+  margin: 0.2em 0 0.4em;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.md-preview :deep(img) {
+  max-width: 100%;
+  height: auto;
+}
+
+.md-preview :deep(.md-code) {
+  margin: 0 0 0.6em;
+  border: 1px solid var(--code-border);
+  border-radius: 8px;
+  background: var(--bg-code);
+  overflow: hidden;
+}
+
+.md-preview :deep(.md-code-lang) {
+  padding: 6px 12px;
+  background: var(--bg-code-head);
+  border-bottom: 1px solid var(--code-border);
+  color: var(--code-text-dim);
+  font-size: 0.6875em;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
+}
+
+.md-preview :deep(.md-code pre) {
+  margin: 0;
+  max-width: 100%;
+  padding: 12px 14px;
+  overflow: hidden;
+  background: transparent;
+  color: var(--code-text);
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 0.8125em;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.md-preview :deep(.md-code code) {
+  font-family: inherit;
+  color: inherit;
+  background: transparent;
+  white-space: inherit;
+  overflow-wrap: inherit;
+}
+
+.md-preview :deep(table) {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.md-preview :deep(th),
+.md-preview :deep(td) {
+  overflow-wrap: anywhere;
+}
+
+.md-preview :deep(a) {
+  color: var(--brand-500);
+}
+
+.md-preview :deep(blockquote) {
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-2);
+}
+
+@container (max-width: 640px) {
+  .ed-split {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  }
 }
 
 .ed-footer {
@@ -1000,6 +1592,49 @@ html[data-wallpaper-clear='1'] .crepe-root .milkdown {
    再小会导致把手翻转盖住文字或触发横向滚动 */
 .crepe-root .milkdown .ProseMirror {
   padding: 20px 72px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 长行在栏宽内折行，不再把整块编辑区撑出横向滚动。
+   代码块靠 white-space: break-spaces 让 CodeMirror 自己认出折行（光标、点击仍按视觉行计算）。 */
+.crepe-root .milkdown .milkdown-code-block,
+.crepe-root .milkdown .milkdown-table-block {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.crepe-root .milkdown .cm-editor,
+.crepe-root .milkdown .cm-scroller {
+  max-width: 100%;
+}
+
+.crepe-root .milkdown .cm-scroller {
+  overflow-x: hidden;
+}
+
+.crepe-root .milkdown .cm-content {
+  flex-shrink: 1;
+  max-width: 100%;
+  white-space: break-spaces;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.crepe-root .milkdown .milkdown-table-block table {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.crepe-root .milkdown .milkdown-table-block th,
+.crepe-root .milkdown .milkdown-table-block td {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.crepe-root .milkdown .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 /* 把手容器默认 margin 0 10px：随边距收窄一并去掉，保证把手完整落在边距内 */

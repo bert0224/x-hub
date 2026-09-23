@@ -187,11 +187,10 @@ const resCount = computed(() => {
   }
 })
 
-// ---- 倒计时（未结束 + end_at 升序，同 CountdownCard.activeCountdowns）----
+// ---- 倒计时（end_at 升序，同 CountdownCard.sortedCountdowns：已结束仍在列表，仅状态不同）----
 const countdownList = computed(() =>
-  store.state.countdowns
-    .filter((c) => !c.finished)
-    .sort((a, b) => a.end_at - b.end_at)
+  [...store.state.countdowns]
+    .sort((a, b) => a.end_at - b.end_at || b.id - a.id)
     .slice(0, 8),
 )
 
