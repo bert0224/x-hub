@@ -41,8 +41,7 @@ watch(
     try {
       perms.value = await tauriApi.getExtensionPermissions(e.id)
     } catch {
-      // 查询失败时按 manifest 声明默认授权
-      perms.value = Object.fromEntries(e.permissions.map((p) => [p, true]))
+      showToast('权限状态读取失败，请重新打开权限设置')
     } finally {
       permsLoading.value = false
     }
@@ -82,6 +81,7 @@ const PERMISSION_LABELS: Record<string, string> = {
   fs: '保存文件（写入系统下载目录）',
   clipboard: '访问剪贴板',
   network: '访问网络',
+  'service:execute': '运行本地后端（信任当前版本）',
   system: '打开应用 / 网页 / 本地路径',
   notify: '发送系统通知',
   events: '广播扩展事件',
@@ -218,17 +218,18 @@ async function confirmUninstall() {
 
             <section class="es-block">
               <h3 class="es-block-title">权限</h3>
-              <div v-if="ext.permissions.length" class="es-perm-list">
-                <div v-for="p in ext.permissions" :key="p" class="es-perm-row" :title="p">
+              <p v-if="ext.runtime === 'service'" class="es-empty">本地后端可读取你有权限访问的文件并联网，未受系统沙箱隔离。仅在信任作者与当前版本时开启；更新版本后需重新授权。关闭网络权限也会停止后端。</p>
+              <div v-if="Object.keys(perms).length" class="es-perm-list">
+                <div v-for="p in Object.keys(perms)" :key="p" class="es-perm-row" :title="p">
                   <span class="es-perm-name">{{ permissionLabel(p) }}</span>
                   <button
                     class="toggle"
                     role="switch"
                     type="button"
-                    :aria-checked="perms[p] ?? true"
-                    :class="{ on: perms[p] ?? true }"
+                    :aria-checked="perms[p] ?? false"
+                    :class="{ on: perms[p] ?? false }"
                     :disabled="permsLoading"
-                    @click="togglePermission(p, !(perms[p] ?? true))"
+                    @click="togglePermission(p, !(perms[p] ?? false))"
                   >
                     <span class="toggle-knob"></span>
                   </button>

@@ -65,6 +65,7 @@ void frameRef
       ref="frameRef"
       class="ev-frame"
       title="扩展视图"
+      sandbox="allow-scripts allow-same-origin allow-downloads"
     />
   </div>
 </template>

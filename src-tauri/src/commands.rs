@@ -3041,6 +3041,7 @@ pub fn set_clipboard_retention(
 /// 外网连通性探活（前端据此切换在线/离线显隐）
 #[tauri::command]
 pub async fn check_connectivity() -> bool {
+    if !config::load().online_enabled { return false; }
     crate::online::check_connectivity().await
 }
 
@@ -3063,12 +3064,14 @@ pub async fn get_weather() -> Result<Option<crate::online::WeatherCurrent>, Stri
 /// 随机获取一条名言（hitokoto）
 #[tauri::command]
 pub async fn get_quote() -> Result<crate::online::Quote, String> {
+    if !config::load().online_enabled { return Err("联网功能已关闭".into()); }
     crate::online::fetch_quote().await
 }
 
 /// 按城市名解析经纬度并缓存到配置（设置里手动配城市）
 #[tauri::command]
 pub async fn set_weather_city(city: String) -> Result<crate::online::GeoLocation, String> {
+    if !config::load().online_enabled { return Err("联网功能已关闭，请开启后设置城市".into()); }
     let city = city.trim().to_string();
     if city.is_empty() {
         return Err("城市名不能为空".to_string());
@@ -3086,6 +3089,7 @@ pub async fn set_weather_city(city: String) -> Result<crate::online::GeoLocation
 /// IP 自动定位并缓存经纬度（设置里「自动定位」按钮）
 #[tauri::command]
 pub async fn locate_weather_by_ip() -> Result<crate::online::GeoLocation, String> {
+    if !config::load().online_enabled { return Err("联网功能已关闭".into()); }
     let loc = crate::online::ip_locate().await?;
     let _guard = crate::config::lock();
     let mut config = config::load();

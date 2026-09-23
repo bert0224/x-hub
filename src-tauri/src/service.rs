@@ -156,6 +156,10 @@ pub fn start_service(
     app: &tauri::AppHandle,
     ext_id: &str,
 ) -> Result<u16, String> {
+    if !crate::extension::permission_granted(app, ext_id, "service:execute")
+        || !crate::extension::permission_granted(app, ext_id, "network") {
+        return Err("PERMISSION_DENIED: 本地后端未获信任或网络权限已关闭，请检查扩展权限设置".into());
+    }
     let state = app.state::<ServiceState>();
     {
         let map = state.0.lock().map_err(|e| e.to_string())?;
@@ -213,6 +217,11 @@ pub fn start_service(
     let port = alloc_port(&listen_host, backend.port)?;
 
     let mut cmd = std::process::Command::new(&node_exe);
+    // 不把宿主继承的云凭据、代理认证与 NODE_OPTIONS 等环境泄露给扩展。
+    cmd.env_clear();
+    for key in ["SystemRoot", "windir", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMSPEC"] {
+        if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+    }
     cmd.arg(&entry)
         .current_dir(&cwd)
         .env("PORT", port.to_string())
@@ -314,6 +323,7 @@ pub fn start_service(
 
 /// 停止并清理 service 扩展后端进程（卸载 / 宿主退出时调用）
 pub fn stop_service(app: &tauri::AppHandle, ext_id: &str) {
+    if let Some(proxy) = app.try_state::<crate::proxy::ProxyState>() { proxy.revoke(ext_id); }
     let mut rt = match app.state::<ServiceState>().0.lock() {
         Ok(mut map) => map.remove(ext_id),
         Err(_) => return,

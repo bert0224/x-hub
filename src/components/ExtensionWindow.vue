@@ -51,6 +51,7 @@ void frameRef
       ref="frameRef"
       class="ew-frame"
       title="扩展窗口"
+      sandbox="allow-scripts allow-same-origin allow-downloads"
     />
   </div>
 </template>

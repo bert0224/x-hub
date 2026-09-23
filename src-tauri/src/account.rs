@@ -1,7 +1,7 @@
 //! 平台账号（x-hub-server）：登录、额度、开发者身份、提交。
 //!
 //! 设计要点：
-//! - **凭据存储与 `chat.rs` 同口径**：系统钥匙串优先，失败回退本地文件（不明文散落在配置里）。
+//! - **凭据存储与 `chat.rs` 同口径**：只写系统钥匙串；旧明文文件成功迁移后清理。
 //! - **登录方式**（P1a）：GitHub Device Flow 与邮箱验证码，**都由服务端代理**——
 //!   客户端只与本机配置的 `server_url` 通信，不直连 GitHub（弱网/受限网络更稳，
 //!   且 device_code 只留在服务端）。
@@ -11,7 +11,7 @@
 //!   否则老用户升级后会继续打旧地址、又没有任何界面可以改回来。
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 const KEYRING_SERVICE: &str = "x-hub-account";
 const TOKEN_KEY: &str = "session-token";
@@ -91,31 +91,29 @@ pub struct DevApplyStatus {
     pub invite_redeemed: bool,
 }
 
-// ---------------- token 存取（钥匙串优先，文件回退） ----------------
+// ---------------- token 存取（只用系统钥匙串） ----------------
 
 fn token_file() -> std::path::PathBuf {
     crate::config::config_dir().join("account_token.json")
 }
 
 fn save_token(token: &str) -> Result<(), String> {
+    crate::credentials::migrate_to_keyring(&token_file(), KEYRING_SERVICE, Some(TOKEN_KEY))?;
     match keyring::Entry::new(KEYRING_SERVICE, TOKEN_KEY) {
         Ok(entry) => entry
             .set_password(token)
             .map_err(|e| format!("钥匙串写入失败: {e}")),
-        Err(_) => {
-            let json = json!({ "token": token }).to_string();
-            std::fs::write(token_file(), json).map_err(|e| e.to_string())
-        }
+        Err(_) => Err("系统钥匙串不可用，未保存明文登录凭据".into()),
     }
 }
 
 fn load_token() -> Option<String> {
+    if let Err(e) = crate::credentials::migrate_to_keyring(&token_file(), KEYRING_SERVICE, Some(TOKEN_KEY)) {
+        log::warn!("旧账号凭据迁移未完成: {e}");
+    }
     match keyring::Entry::new(KEYRING_SERVICE, TOKEN_KEY) {
         Ok(entry) => entry.get_password().ok(),
-        Err(_) => std::fs::read_to_string(token_file())
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string())),
+        Err(_) => None,
     }
 }
 
@@ -150,6 +148,7 @@ fn client() -> Result<reqwest::Client, String> {
         );
     }
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .default_headers(headers)
         .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
         .build()

@@ -3,10 +3,9 @@
 //! 为什么不再让扩展走 asset 协议（见 `docs/adr/0008-extension-content-origin-isolation.md`）：
 //! asset 协议的作用域是**全局单例**，而扩展 iframe 一旦与用户数据同源，扩展里一行 `fetch`
 //! 就能取走数据根下的数据库（`xhub.db`）、`app.json` 与日志，**绕开桥 API 的权限系统**。
-//! 改用独立协议后，扩展 origin 是 `xhub-ext.localhost`，与 `asset.localhost`
-//! （图标 / 壁纸 / 剪贴板图片）**跨源**，扩展从此碰不到宿主数据命名空间。
+//! 每个扩展使用独立 origin，且与宿主、asset 数据协议跨源。
 //!
-//! URL 形态：`http://xhub-ext.localhost/<扩展 id>/<扩展目录内相对路径>`
+//! URL 形态：`http://xhub-ext.e-<id 摘要>.localhost/<扩展 id>/<相对路径>`。
 //! - WebView2 把自定义协议映射为 `http://<scheme>.localhost/`；非 Windows 平台为
 //!   `<scheme>://localhost/`，见 [`base_url`]。
 //! - 入口 HTML 由本模块**动态注入桥脚本**后返回，不再把注入结果落盘到扩展目录的
@@ -17,6 +16,7 @@
 //! （防符号链接逃逸）。
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -92,11 +92,27 @@ pub fn base_url() -> &'static str {
     }
 }
 
+/// 每个扩展使用独立且稳定的主机名，禁止通过 document.domain 降级为共同来源。
+pub fn origin(id: &str) -> String {
+    let host = content_host(id);
+    if cfg!(target_os = "windows") || cfg!(target_os = "android") {
+        format!("http://xhub-ext.{host}")
+    } else {
+        format!("xhub-ext://{host}")
+    }
+}
+
+fn content_host(id: &str) -> String {
+    let hash = Sha256::digest(id.as_bytes());
+    let key: String = hash[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("e-{key}.localhost")
+}
+
 /// 把扩展 id 与扩展目录内的相对路径拼成 iframe 可加载的入口 URL。
 /// `rel` 形如 `./module/index.html`（manifest 里写的是相对路径）。
 pub fn entry_url(id: &str, rel: &str) -> String {
     let rel = encode_rel_path(rel);
-    format!("{}{}/{}", base_url(), encode_segment(id), rel)
+    format!("{}/{}/{}", origin(id), encode_segment(id), rel)
 }
 
 fn encode_segment(seg: &str) -> String {
@@ -159,11 +175,19 @@ pub fn handle(app: &tauri::AppHandle, request: Request<Vec<u8>>) -> Response<Vec
         .get("referer")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    match serve(app, &raw_path, referer.as_deref()) {
+    let host = request.uri().host().unwrap_or("");
+    let resolved = request_path_for_host(host, &raw_path, referer.as_deref());
+    let result = resolved.and_then(|path| serve(app, &path, None));
+    match result {
         Ok((mime, bytes)) => Response::builder()
             .status(200)
             .header("Content-Type", mime)
             .header("Cache-Control", CACHE_CONTROL)
+            .header("Content-Security-Policy", content_csp(app, &resolved_id(host, &raw_path, referer.as_deref())))
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Referrer-Policy", "same-origin")
+            .header("Origin-Agent-Cluster", "?1")
+            .header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), document-domain=()")
             .body(bytes)
             .unwrap(),
         Err(status) => Response::builder()
@@ -174,10 +198,49 @@ pub fn handle(app: &tauri::AppHandle, request: Request<Vec<u8>>) -> Response<Vec
     }
 }
 
+fn resolved_id(host: &str, path: &str, referer: Option<&str>) -> String {
+    request_path_for_host(host, path, referer).ok()
+        .and_then(|p| parse_request_path(&p).ok()).map(|(id, _)| id).unwrap_or_default()
+}
+
+/// 主机名与路径中的扩展身份必须一致；旧 ../assets 写法只回退到同一独立来源。
+fn request_path_for_host(host: &str, path: &str, referer: Option<&str>) -> Result<String, u16> {
+    if let Ok((id, _)) = parse_request_path(path) {
+        if host == content_host(&id) { return Ok(path.to_string()); }
+    }
+    if let Some(referer) = referer {
+        if let Ok(uri) = referer.parse::<tauri::http::Uri>() {
+            if let Ok((id, _)) = parse_request_path(uri.path().trim_start_matches('/')) {
+                if referer.starts_with(&format!("{}/", origin(&id))) && host == content_host(&id) {
+                    parse_rel_path(path)?;
+                    return Ok(format!("{id}/{path}"));
+                }
+            }
+        }
+    }
+    Err(403)
+}
+
+fn content_csp(app: &tauri::AppHandle, id: &str) -> String {
+    let network = crate::extension::read_manifest(&resolve_ext_dir(app, id).unwrap_or_default())
+        .map(|m| m.permissions.iter().any(|p| p == "network"))
+        .unwrap_or(false) && crate::extension::permission_granted(app, id, "network");
+    let proxy = app.try_state::<crate::proxy::ProxyState>()
+        .map(|s| format!(" http://127.0.0.1:{} ws://127.0.0.1:{}", s.port, s.port))
+        .unwrap_or_default();
+    build_content_csp(network, &proxy)
+}
+
+fn build_content_csp(network: bool, proxy: &str) -> String {
+    let remote = if network { " https: wss:" } else { "" };
+    format!("default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:{remote}; font-src 'self' data:; connect-src 'self'{proxy}{remote}; media-src 'self' blob:{remote}; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'; worker-src 'self' blob:")
+}
+
 /// 段是否危险：`..` 逃逸 / 反斜杠 / 冒号（Windows 盘符与 NTFS 数据流）/ NUL / 控制字符
 fn is_unsafe_segment(seg: &str) -> bool {
     seg == ".."
         || seg.contains('\\')
+        || seg.contains('/')
         || seg.contains(':')
         || seg.contains('\0')
         || seg.chars().any(|c| c.is_control())
@@ -309,6 +372,10 @@ fn serve(app: &tauri::AppHandle, raw_path: &str, referer: Option<&str>) -> Resul
         return Err(404);
     }
 
+    let canonical_parts: Vec<String> = full_canon.strip_prefix(&root_canon).map_err(|_| 403u16)?
+        .iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    if !public_content_path(&rel_parts) || !public_content_path(&canonical_parts) { return Err(403); }
+
     let mut bytes = std::fs::read(&full_canon).map_err(|_| 404u16)?;
     let mime = mime_for(&full_canon);
     // 入口 HTML：动态注入桥脚本（等价于旧的 `.xhpack/<surface>.html`，但不落盘）
@@ -323,6 +390,15 @@ fn serve(app: &tauri::AppHandle, raw_path: &str, referer: Option<&str>) -> Resul
         }
     }
     Ok((mime.to_string(), bytes))
+}
+
+/// 配置、凭据、运行数据与开发元数据不能通过网页资源协议读取。
+fn public_content_path(parts: &[String]) -> bool {
+    parts.iter().all(|p| {
+        let p = p.to_ascii_lowercase();
+        !p.starts_with('.') && !matches!(p.as_str(), "backend" | "server" | "node_modules" | "data" | "logs")
+            && !crate::market::sensitive_package_file(&p)
+    })
 }
 
 /// 是否是需要注入桥脚本的 HTML（按扩展名，别看 MIME 字符串）
@@ -368,6 +444,15 @@ fn mime_for(path: &std::path::Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_network_permission_controls_content_policy() {
+        let blocked = super::build_content_csp(false, " http://127.0.0.1:12345");
+        assert!(!blocked.contains("https:"));
+        assert!(blocked.contains("http://127.0.0.1:12345"));
+        assert!(blocked.contains("frame-src 'none'"));
+        assert!(blocked.contains("form-action 'none'"));
+        assert!(super::build_content_csp(true, "").contains("https: wss:"));
+    }
     use super::*;
 
     #[test]
@@ -385,7 +470,7 @@ mod tests {
     fn entry_url_encodes_each_segment() {
         assert_eq!(
             entry_url("com.x-hub.ctool", "./module/index.html"),
-            format!("{}com.x-hub.ctool/module/index.html", base_url())
+            format!("{}/com.x-hub.ctool/module/index.html", origin("com.x-hub.ctool"))
         );
         // 空格与中文按段编码，斜杠保留
         let url = entry_url("com.x-hub.x", "./my dir/页 面.html");
@@ -486,5 +571,22 @@ mod tests {
         assert_eq!(parse_request_path("com.x-hub.x/C:/Windows/win.ini").unwrap_err(), 400); // 盘符冒号
         assert_eq!(parse_request_path("com.x-hub.x/a%00b.js").unwrap_err(), 400); // NUL
         assert_eq!(parse_request_path("com.x-hub.x/a%0Ab.js").unwrap_err(), 400); // 控制字符
+    }
+
+    #[test]
+    fn security_content_origins_and_private_files_are_isolated() {
+        let a = "com.x-hub.a";
+        let b = "com.x-hub.b";
+        assert_ne!(origin(a), origin(b));
+        assert!(request_path_for_host(&content_host(a), &format!("{a}/index.html"), None).is_ok());
+        assert!(request_path_for_host(&content_host(a), &format!("{b}/index.html"), None).is_err());
+        assert!(request_path_for_host("localhost", &format!("{a}/index.html"), None).is_err());
+        for p in [".config.json", ".storage.json", ".env", "app.db", "credentials.json", "server/key.js", "data/cache.json"] {
+            assert!(!public_content_path(&p.split('/').map(String::from).collect::<Vec<_>>()), "{p}");
+        }
+        assert!(public_content_path(&vec!["assets".into(), "app.js".into()]));
+        assert!(parse_request_path(&format!("{a}/a%2F..%2Fsecret")).is_err());
+        let referer = entry_url(a, "index.html");
+        assert_eq!(request_path_for_host(&content_host(a), "assets/app.js", Some(&referer)).unwrap(), format!("{a}/assets/app.js"));
     }
 }

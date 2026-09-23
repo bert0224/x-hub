@@ -52,6 +52,10 @@ pub struct Capability {
 /// 全部桥 API 能力表。新增能力只改这里 + 补 handler 函数。
 pub(crate) static CAPABILITIES: &[Capability] = &[
     Capability {
+        namespace: "runtime", method: "openExternal", permission: Some("network"),
+        handler: CapabilityHandler::Sync(runtime_open_external),
+    },
+    Capability {
         namespace: "runtime",
         method: "info",
         permission: None,
@@ -621,6 +625,12 @@ async fn dispatch(
 
 // ---------- runtime ----------
 
+fn runtime_open_external(_app: &tauri::AppHandle, _state: &DbState, _ext_id: &str, args: Value) -> Result<Value, String> {
+    let url = args.get("url").and_then(Value::as_str).ok_or("INVALID_ARGUMENT: 缺少 URL")?;
+    crate::process::open_external(url.to_string())?;
+    Ok(Value::Null)
+}
+
 /// runtime.callExtension：校验目标扩展 manifest.expose 是否包含该方法（跨扩展调用白名单）。
 /// 实际的请求-响应路由在前端完成（调用方 iframe → 主窗口 → 目标 iframe）。
 fn runtime_call_extension(
@@ -664,9 +674,9 @@ fn runtime_info(
     let is_service = manifest.runtime == ExtensionRuntime::Service;
     // 代理前缀：service 扩展返回完整 URL（前端可直接 fetch/WebSocket 该前缀访问后端）
     let proxy_prefix = if is_service {
-        let proxy_port = app.state::<crate::proxy::ProxyState>().0;
-        if proxy_port > 0 {
-            Some(format!("http://127.0.0.1:{proxy_port}/svc/{ext_id}"))
+        let proxy = app.state::<crate::proxy::ProxyState>();
+        if proxy.port > 0 {
+            Some(proxy.prefix(ext_id)?)
         } else {
             None
         }
@@ -2110,6 +2120,9 @@ fn service_request(app: tauri::AppHandle, ext_id: String, args: Value) -> BoxFut
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "INVALID_ARGUMENT: 缺少 path".to_string())?;
+        if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+            return Err("INVALID_ARGUMENT: service 路径必须以单个 / 开头".into());
+        }
         let method = args
             .get("method")
             .and_then(|v| v.as_str())
@@ -2118,7 +2131,8 @@ fn service_request(app: tauri::AppHandle, ext_id: String, args: Value) -> BoxFut
             .ok_or_else(|| format!("NOT_FOUND: service 未启动（{ext_id}）"))?;
         let url = format!("http://127.0.0.1:{port}{path}");
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
         let mut req = match method.to_uppercase().as_str() {
             "GET" => client.get(&url),
             "POST" => client.post(&url),

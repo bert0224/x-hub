@@ -38,7 +38,7 @@ pub struct GeoLocation {
 const CONNECTIVITY_URL: &str = "https://www.baidu.com";
 const WEATHER_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const GEOCODE_URL: &str = "https://geocoding-api.open-meteo.com/v1/search";
-const IP_LOCATE_URL: &str = "http://ip-api.com/json/";
+const IP_LOCATE_URL: &str = "https://ipwho.is/";
 const QUOTE_URL: &str = "https://v1.hitokoto.cn/";
 const USER_AGENT: &str = "x-hub/0.1 (local-first desktop dashboard)";
 
@@ -245,6 +245,7 @@ fn lookup_city(name: &str) -> Option<(&'static str, f64, f64)> {
 
 fn client(timeout_secs: u64) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .user_agent(USER_AGENT)
         .build()
@@ -362,14 +363,14 @@ async fn geocode_remote(name: &str) -> Result<GeoLocation, String> {
     })
 }
 
-/// IP → 经纬度（ip-api.com 免费版，一次性定位，结果本地固化）。
+/// IP → 经纬度（HTTPS，一次性定位，结果本地固化）。
 pub async fn ip_locate() -> Result<GeoLocation, String> {
     let c = client(10)?;
     let resp = c
         .get(IP_LOCATE_URL)
         .query(&[(
             "fields",
-            "status,message,lat,lon,city,countryCode".to_string(),
+            "success,message,latitude,longitude,city,country_code".to_string(),
         )])
         .send()
         .await
@@ -383,7 +384,11 @@ pub async fn ip_locate() -> Result<GeoLocation, String> {
         .await
         .map_err(|e| format!("IP 定位解析失败: {}", e))?;
 
-    if body["status"].as_str() != Some("success") {
+    parse_ip_location(&body)
+}
+
+fn parse_ip_location(body: &serde_json::Value) -> Result<GeoLocation, String> {
+    if body["success"].as_bool() != Some(true) {
         return Err(
             body["message"]
                 .as_str()
@@ -391,10 +396,13 @@ pub async fn ip_locate() -> Result<GeoLocation, String> {
                 .to_string(),
         );
     }
-    let lat = body["lat"].as_f64().ok_or("纬度缺失")?;
-    let lng = body["lon"].as_f64().ok_or("经度缺失")?;
+    let lat = body["latitude"].as_f64().ok_or("纬度缺失")?;
+    let lng = body["longitude"].as_f64().ok_or("经度缺失")?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+        return Err("定位结果经纬度超出范围".into());
+    }
     let city = body["city"].as_str().unwrap_or("").to_string();
-    let country = body["countryCode"].as_str().unwrap_or("").to_string();
+    let country = body["country_code"].as_str().unwrap_or("").to_string();
     let name = match (city.is_empty(), country.is_empty()) {
         (false, false) => format!("{}·{}", city, country),
         (false, true) => city,
@@ -433,6 +441,15 @@ pub async fn fetch_quote() -> Result<Quote, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_ip_location_validates_https_response() {
+        assert!(IP_LOCATE_URL.starts_with("https://"));
+        let location = parse_ip_location(&serde_json::json!({"success": true, "latitude": 31.2, "longitude": 121.5, "city": "上海", "country_code": "CN"})).unwrap();
+        assert_eq!(location.name, "上海·CN");
+        assert!(parse_ip_location(&serde_json::json!({"success": false})).is_err());
+        assert!(parse_ip_location(&serde_json::json!({"success": true, "latitude": 999, "longitude": 1})).is_err());
+    }
 
     #[test]
     fn quote_struct_roundtrip() {

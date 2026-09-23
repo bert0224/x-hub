@@ -1136,9 +1136,10 @@ export function useStore() {
 
   /** 探测外网连通性并更新 state.online（滞回：连续 3 次失败才判离线，避免单次抖动） */
   async function checkOnline(): Promise<boolean> {
-    if (!isTauri()) return false
+    if (!isTauri() || !state.config.online_enabled) return false
     try {
       const ok = await tauriApi.checkConnectivity()
+      if (!state.config.online_enabled) return false
       if (ok) {
         failStreak = 0
         state.online = true
@@ -1232,7 +1233,7 @@ export function useStore() {
 
   /** 启动在线状态监听：立即探测 + 每 60s 探测 + 天气每 30 分钟刷新 */
   function startOnlineMonitor() {
-    if (onlineTimer || !isTauri()) return
+    if (onlineTimer || !isTauri() || !state.config.online_enabled) return
     const tick = async () => {
       const prev = state.online
       const ok = await checkOnline()

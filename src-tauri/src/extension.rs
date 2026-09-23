@@ -398,7 +398,7 @@ fn load_extension(dir: &Path, source: &str) -> ExtensionEntry {
 
     let icon = manifest.icon.as_ref().and_then(|rel| {
         let p = dir.join(rel);
-        p.is_file().then(|| p.to_string_lossy().into_owned())
+        p.is_file().then(|| crate::ext_protocol::entry_url(&manifest.id, rel))
     });
 
     // 条件禁用求值（manifest.disabled）
@@ -495,10 +495,7 @@ pub fn apply_dev_extensions(app: &tauri::AppHandle) {
             log::warn!("开发扩展目录不存在，跳过放行: {dir}");
             continue;
         }
-        // 目录须先存在再放行：allow_directory 会额外注册 canonicalize 后的模式变体
-        if let Err(e) = app.asset_protocol_scope().allow_directory(&path, true) {
-            log::warn!("开发扩展目录放行失败 {dir}: {e}");
-        }
+        // 扩展资源只由独立内容协议提供，不能加入全局 asset 作用域。
         if let Some(state) = app.try_state::<crate::ext_protocol::DevExtensionDirs>() {
             let id = read_manifest(&path).map(|m| m.id).unwrap_or_else(|_| {
                 path.file_name()
@@ -624,10 +621,7 @@ pub fn add_dev_extension(app: tauri::AppHandle, path: String) -> Result<DevModeS
         cfg.dev_extensions.push(dir_str.clone());
         crate::config::save(&cfg)?;
     }
-    // 登记即放行：本机源码目录加进来就是要调试，不设额外开关（ADR 0005 v0.6.x 修订）
-    app.asset_protocol_scope()
-        .allow_directory(&canonical, true)
-        .map_err(|e| format!("IO_ERROR: 目录放行失败：{e}"))?;
+    // 登记即加载，但不把源码目录暴露到共享 asset 来源。
     if let Some(state) = app.try_state::<crate::ext_protocol::DevExtensionDirs>() {
         state.insert(manifest.id.clone(), canonical.clone());
     }
@@ -807,6 +801,8 @@ pub(crate) const XHUB_BRIDGE_SCRIPT: &str = r#"
     if(wp.immersive){root.setAttribute('data-xhub-immersive','1');}else{root.removeAttribute('data-xhub-immersive');}
   }
   window.addEventListener('message',function(e){
+    if(e.source!==window.parent)return;
+    if(['http://tauri.localhost','https://tauri.localhost','tauri://localhost','http://localhost:1420'].indexOf(e.origin)<0)return;
     var m=e.data;if(!m||m.__xhub!==true)return;
     if(m.type==='result'){
       var p=pending[m.id];if(!p)return;delete pending[m.id];
@@ -1025,6 +1021,9 @@ pub fn read_extension_entry(
 
     // service 扩展：打开时懒启动后端（探活成功则后续 runtime.info 返回 serviceReady=true）
     if manifest.runtime == ExtensionRuntime::Service {
+        if !permission_granted(&app, &id, "service:execute") {
+            return Err("PERMISSION_DENIED: 本地后端尚未授权。请在扩展权限设置中确认信任此版本后开启「运行本地后端」".into());
+        }
         if let Err(e) = crate::service::start_service(&app, &id) {
             // 不阻断前端加载：前端仍能打开，runtime.info 会返回 serviceReady=false
             log::warn!("service 扩展 {id} 后端启动失败: {e}");
@@ -1209,10 +1208,21 @@ fn write_permission_overrides(
 /// 某权限是否被授予：manifest 声明后默认授权，除非用户显式关闭。
 pub fn permission_granted(app: &tauri::AppHandle, ext_id: &str, perm: &str) -> bool {
     let overrides = read_permission_overrides(app, ext_id);
+    if perm == "service:execute" {
+        let version = crate::ext_protocol::resolve_ext_dir(app, ext_id).ok()
+            .and_then(|dir| read_manifest(&dir).ok()).map(|m| m.version);
+        return service_version_trusted(&overrides, version.as_deref());
+    }
     overrides
         .get(perm)
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
+}
+
+fn service_version_trusted(overrides: &Map<String, Value>, version: Option<&str>) -> bool {
+    version.is_some()
+        && overrides.get("service:execute").and_then(Value::as_bool) == Some(true)
+        && version == overrides.get("service:version").and_then(Value::as_str)
 }
 
 /// 查询扩展权限状态：manifest 声明的权限 → 是否授予。
@@ -1226,7 +1236,11 @@ pub fn get_extension_permissions(
     let manifest = read_manifest(&dir)?;
     let overrides = read_permission_overrides(&app, &id);
     let mut result = HashMap::new();
+    if manifest.runtime == ExtensionRuntime::Service {
+        result.insert("service:execute".into(), permission_granted(&app, &id, "service:execute"));
+    }
     for p in manifest.permissions {
+        if p == "service:execute" { continue; }
         let granted = overrides.get(&p).and_then(|v| v.as_bool()).unwrap_or(true);
         result.insert(p, granted);
     }
@@ -1242,12 +1256,23 @@ pub fn set_extension_permission(
     granted: bool,
 ) -> Result<(), String> {
     let mut overrides = read_permission_overrides(&app, &id);
-    if granted {
+    let manifest = read_manifest(&crate::ext_protocol::resolve_ext_dir(&app, &id)?)?;
+    if permission == "service:execute" && manifest.runtime == ExtensionRuntime::Service {
+        overrides.insert(permission.clone(), Value::Bool(granted));
+        overrides.insert("service:version".into(), Value::String(manifest.version));
+    } else if !manifest.permissions.contains(&permission) {
+        return Err("INVALID_ARGUMENT: 扩展未声明此权限".into());
+    } else if granted {
         overrides.remove(&permission);
     } else {
         overrides.insert(permission.clone(), Value::Bool(false));
     }
     write_permission_overrides(&app, &id, &overrides)?;
+    if !granted && matches!(permission.as_str(), "service:execute" | "network") {
+        crate::service::stop_service(&app, &id);
+    }
+    use tauri::Emitter;
+    let _ = app.emit("extension-permissions-changed", &id);
     log::info!("扩展权限更新: {id} {permission} granted={granted}");
     Ok(())
 }
@@ -1256,6 +1281,19 @@ pub fn set_extension_permission(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn security_service_requires_explicit_current_version_trust() {
+        assert!(!service_version_trusted(&Map::new(), Some("1.0.0")));
+        let mut permissions = Map::new();
+        permissions.insert("service:execute".into(), Value::Bool(true));
+        assert!(!service_version_trusted(&permissions, None));
+        permissions.insert("service:version".into(), Value::String("1.0.0".into()));
+        assert!(service_version_trusted(&permissions, Some("1.0.0")));
+        assert!(!service_version_trusted(&permissions, Some("1.0.1")));
+        permissions.insert("service:execute".into(), Value::Bool(false));
+        assert!(!service_version_trusted(&permissions, Some("1.0.0")));
+    }
 
     fn write_manifest(root: &Path, id: &str, manifest: serde_json::Value) {
         let dir = root.join(id);

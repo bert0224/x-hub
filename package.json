@@ -4,6 +4,7 @@
   "version": "0.6.5",
   "type": "module",
   "scripts": {
+    "test:security": "node --test tests/security.test.mjs",
     "dev": "vite",
     "prebuild": "node scripts/gen-settings-index.mjs && node scripts/check-settings-css.mjs",
     "check:settings-css": "node scripts/check-settings-css.mjs",

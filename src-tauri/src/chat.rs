@@ -25,7 +25,7 @@ pub struct ChatUsage {
     pub reasoning: i64,
 }
 
-/// API Key 存系统钥匙串（keyring），失败时回退到本地受限权限文件，保证可用性
+/// API Key 仅存系统钥匙串，失败时明确报错，不降级写入明文。
 const KEYRING_SERVICE: &str = "x-hub-chat";
 
 /// 平台中转的占位 Key：真实凭据是账号会话 token（登录态），不写进配置也不写钥匙串。
@@ -63,53 +63,23 @@ pub fn platform_base_url() -> String {
 }
 
 pub fn save_api_key(model_id: &str, key: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, model_id).map_err(|e| e.to_string());
-    match entry {
-        Ok(e) => e.set_password(key).map_err(|e| format!("钥匙串写入失败: {}", e)),
-        Err(_) => save_key_file(model_id, key),
-    }
+    crate::credentials::migrate_to_keyring(&key_file_path(), KEYRING_SERVICE, None)?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, model_id).map_err(|e| e.to_string())?;
+    entry.set_password(key).map_err(|e| format!("钥匙串写入失败，未保存明文: {e}"))
 }
 
 pub fn get_api_key(model_id: &str) -> Option<String> {
+    if let Err(e) = crate::credentials::migrate_to_keyring(&key_file_path(), KEYRING_SERVICE, None) {
+        log::warn!("旧 AI 凭据迁移未完成: {e}");
+    }
     match keyring::Entry::new(KEYRING_SERVICE, model_id) {
         Ok(e) => e.get_password().ok(),
-        Err(_) => load_key_file(model_id),
+        Err(_) => None,
     }
 }
 
 fn key_file_path() -> std::path::PathBuf {
     config::config_dir().join("chat_keys.json")
-}
-
-fn save_key_file(model_id: &str, key: &str) -> Result<(), String> {
-    let path = key_file_path();
-    let mut keys: serde_json::Map<String, Value> = load_key_file_map();
-    keys.insert(model_id.to_string(), Value::String(key.to_string()));
-    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))
-        .map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(&keys).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-fn load_key_file_map() -> serde_json::Map<String, Value> {
-    std::fs::read_to_string(key_file_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
-}
-
-fn load_key_file(model_id: &str) -> Option<String> {
-    load_key_file_map()
-        .get(model_id)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
 }
 
 /// 拉取平台可用模型（「使用平台免费额度」用；需登录账号）
@@ -149,6 +119,7 @@ where
     })?;
 
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {}", e))?;
@@ -171,6 +142,7 @@ where
         model.base_url.trim().to_string()
     };
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    crate::credentials::validate_endpoint(&url)?;
     let payload = serde_json::json!({
         "model": model.model,
         "messages": payload_messages,
@@ -298,7 +270,9 @@ pub async fn fetch_provider_models(
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<String>, String> {
+    crate::credentials::validate_endpoint(base_url)?;
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败: {}", e))?;

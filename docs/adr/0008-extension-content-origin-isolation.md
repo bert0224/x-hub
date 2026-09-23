@@ -1,5 +1,9 @@
 # 0008-扩展内容与宿主数据必须不同源：资产作用域收紧 + 扩展独立协议
 
+> **2026-09-23 安全修订**：下文保留初次迁移背景；当前每个扩展使用 `http://xhub-ext.e-<id 摘要>.localhost` 独立来源。共享 `asset` 作用域只保留图标、壁纸和剪贴板图片，不再包含已安装或开发扩展目录；扩展图标也走独立协议。内容协议拒绝配置、凭据、数据库、日志、后端目录与元数据，并校验规范化后的路径，防止目录内链接绕过。宿主桥同时核对窗口与来源，回复绑定原来源；iframe 沙箱禁止弹窗、顶层导航和表单，内容 CSP 按网络权限放行 HTTPS。网络权限撤销后重建 iframe。跨扩展请求使用宿主分配的独立编号并核验响应窗口，避免编号冲突和伪造回复。
+
+> 来源变更会让直接使用浏览器 `localStorage` / `IndexedDB` 的扩展暂时看不到旧来源数据；旧数据未删除，桥 `storage.*` 不受影响。Node service 仍遵循 ADR 0007 的信任边界。代理要求随机令牌与匹配的 Origin，停止服务时撤销令牌；这不代表后端进程具有操作系统沙箱。
+
 > **状态：已实施**（决策于「扩展市场开放给第三方开发者」设计讨论 2026-09；两部分已于 2026-09-12 落地，验收见 `docs/open-market-client-plan.md` 的 T0.3）。
 
 资产协议（asset protocol）是宿主把本地文件喂给 WebView 的通道：扩展入口 HTML 先写入 `<扩展目录>/.xhpack/<surface>.html`（为了让入口的相对资源同源加载，见 `extension.rs` 内注释），再由前端 `convertFileSrc` 换成 `http://asset.localhost/...` 作为 iframe src。问题出在**作用域是全局单例**，而它的允许范围是 `$APPDATA/**` 加上整个数据根（`tauri.conf.json` 的 `assetProtocol.scope` 与 `lib.rs` 启动时的 `allow_directory(data_root)`）。

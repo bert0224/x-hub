@@ -75,13 +75,18 @@ export function useExtensionFrame(
   const frameRef = ref<HTMLIFrameElement | null>(null)
   const loading = ref(true)
   const error = ref<string | null>(null)
+  // 只信任后端返回的入口来源，不随 iframe 自行导航改变。
+  let expectedOrigin = ''
+  let loadGeneration = 0
+  let disposed = false
+  let unlistenPermissions: (() => void) | undefined
 
   /** 把当前形态 id 广播给扩展 iframe（桥脚本写 data-xhub-variant + CSS 变量 + 派发事件） */
   function broadcastVariant() {
     const frame = frameRef.value
     const variant = getVariant?.() ?? null
-    if (!frame || !frame.contentWindow) return
-    frame.contentWindow.postMessage({ __xhub: true, type: 'variant', variant }, '*')
+    if (!frame || !frame.contentWindow || !expectedOrigin) return
+    frame.contentWindow.postMessage({ __xhub: true, type: 'variant', variant }, expectedOrigin)
   }
 
   // 看门狗状态：扩展 iframe 是否已回传任意桥消息（桥脚本运行即算“已就绪”）
@@ -108,7 +113,9 @@ export function useExtensionFrame(
   function onMessage(e: MessageEvent) {
     const frame = frameRef.value
     // 只处理来自本 iframe 的消息：多实例并存（多个 module 卡片 / drawer）时避免互相串扰
-    if (!frame || !frame.contentWindow || e.source !== frame.contentWindow) return
+    if (!frame || !frame.contentWindow || e.source !== frame.contentWindow
+      || !expectedOrigin || e.origin !== expectedOrigin) return
+    const replyOrigin = expectedOrigin
     const m = e.data as
       | {
           __xhub?: boolean
@@ -159,7 +166,7 @@ export function useExtensionFrame(
     if (m.type === 'open-external') {
       const url = String(m.url ?? '')
       if (/^https?:\/\//i.test(url) && isTauri()) {
-        tauriApi.openExternal(url).catch((err) => {
+        tauriApi.xhubCall(getExtId(), 'runtime', 'openExternal', { url }).catch((err) => {
           const { message } = parseXHubError(err)
           void tauriApi.logClientError({ message: '扩展外链打开失败', detail: `extId=${getExtId()} url=${url} | ${message}` })
         })
@@ -200,7 +207,7 @@ export function useExtensionFrame(
               ok: false,
               error: { message: `无权调用 ${targetId}.${method}` },
             },
-            '*',
+            replyOrigin,
           )
         })
       return
@@ -208,12 +215,12 @@ export function useExtensionFrame(
 
     // 目标扩展的调用结果回传给发起方
     if (m.type === 'xhub-call-result') {
-      routeExtensionCallResult(m.id ?? 0, m.ok === true, m.data, m.error)
+      routeExtensionCallResult(frame, m.id ?? 0, m.ok === true, m.data, m.error)
       return
     }
 
     const reply = (payload: Record<string, unknown>) => {
-      frame.contentWindow?.postMessage({ __xhub: true, type: 'result', id: m.id, ...payload }, '*')
+      frame.contentWindow?.postMessage({ __xhub: true, type: 'result', id: m.id, ...payload }, replyOrigin)
     }
 
     // 主题查询：主题状态在前端 CSS 变量里，宿主直接回包，不走 Rust
@@ -244,6 +251,11 @@ export function useExtensionFrame(
   }
 
   async function load() {
+    const generation = ++loadGeneration
+    expectedOrigin = ''
+    unregisterExtensionFrame(frameRef.value)
+    // 先销毁旧页面，权限撤销后不得让隐藏 iframe 继续按旧 CSP 联网。
+    if (frameRef.value) frameRef.value.src = 'about:blank'
     loading.value = true
     error.value = null
     frameAlive = false
@@ -258,7 +270,10 @@ export function useExtensionFrame(
     }
     try {
       const entryUrl = await tauriApi.readExtensionEntry(getExtId(), getSurface())
+      if (generation !== loadGeneration || disposed) return
       if (frameRef.value) {
+        const parsed = new URL(entryUrl)
+        expectedOrigin = parsed.origin === 'null' ? `${parsed.protocol}//${parsed.host}` : parsed.origin
         const variant = getVariant?.() ?? null
         // 形态经 URL query 随入口首帧到达（桥脚本运行前即可读 location.search），
         // 后续切换走 postMessage 广播（见下方 watch），两种通道互补
@@ -266,6 +281,7 @@ export function useExtensionFrame(
           ? `${entryUrl}?xhub-variant=${encodeURIComponent(variant)}`
           : entryUrl
         frameRef.value.src = url
+        registerExtensionFrame(frameRef.value, getExtId(), expectedOrigin)
         // 看门狗：入口 HTML 已返回但 iframe 在超时内没有任何桥消息（桥脚本未运行）
         // → 判定白屏，落日志并给出友好提示，而不是永远停在空白页
         watchdogTimer = window.setTimeout(() => {
@@ -278,6 +294,7 @@ export function useExtensionFrame(
         }, EXT_LOAD_TIMEOUT_MS)
       }
     } catch (e) {
+      if (disposed || generation !== loadGeneration) return
       const { message } = parseXHubError(e)
       error.value = message
       onError?.(message)
@@ -320,6 +337,16 @@ export function useExtensionFrame(
   }
 
   onMounted(() => {
+    if (isTauri()) {
+      void import('@tauri-apps/api/event').then(({ listen }) => listen<string>(
+        'extension-permissions-changed', (event) => {
+          if (event.payload === getExtId()) void load()
+        },
+      )).then((unlisten) => {
+        if (disposed) unlisten()
+        else unlistenPermissions = unlisten
+      }).catch(() => {})
+    }
     window.addEventListener('message', onMessage)
     document.addEventListener('visibilitychange', onVisibilityChange)
     registerExtensionFrame(frameRef.value, getExtId())
@@ -328,6 +355,10 @@ export function useExtensionFrame(
     devPollTimer = window.setInterval(() => void devPollTick(), DEV_POLL_MS)
   })
   onBeforeUnmount(() => {
+    disposed = true
+    expectedOrigin = ''
+    loadGeneration++
+    unlistenPermissions?.()
     if (watchdogTimer !== undefined) clearTimeout(watchdogTimer)
     if (devPollTimer !== undefined) clearInterval(devPollTimer)
     if (frameRef.value) frameRef.value.removeEventListener('error', onFrameError)

@@ -478,14 +478,13 @@ pub fn pack_dir_to_archive(
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let file = std::fs::File::create(out).map_err(|e| format!("创建安装包失败: {e}"))?;
-    let mut zip = zip::ZipWriter::new(file);
+    // 检查并完成压缩后才写目标，敏感文件检查失败时不留下半包或覆盖已有产物。
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     add_dir_to_zip(&mut zip, dir, dir, options)?;
-    zip.finish().map_err(|e| format!("写入安装包失败: {e}"))?;
-
-    let bytes = std::fs::read(out).map_err(|e| e.to_string())?;
+    let bytes = zip.finish().map_err(|e| format!("写入安装包失败: {e}"))?.into_inner();
+    std::fs::write(out, &bytes).map_err(|e| format!("创建安装包失败: {e}"))?;
     let sha256 = to_hex(&Sha256::digest(&bytes));
     Ok((
         manifest.id,
@@ -531,11 +530,26 @@ fn add_dir_to_zip<W: Write + std::io::Seek>(
     options: zip::write::SimpleFileOptions,
 ) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') || name == "node_modules" {
             continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let is_link = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let is_link = metadata.file_type().is_symlink();
+        if is_link {
+            return Err(format!("打包已中止：不允许符号链接或 junction（{name}）"));
+        }
+        if sensitive_package_file(&name) || (metadata.is_dir() && matches!(name.to_ascii_lowercase().as_str(), "data" | "logs" | "backups")) {
+            return Err(format!("打包已中止：发现可能包含私有数据的文件或目录 {name}，请在干净发布目录中打包"));
         }
         let rel = path
             .strip_prefix(root)
@@ -553,6 +567,15 @@ fn add_dir_to_zip<W: Write + std::io::Seek>(
         }
     }
     Ok(())
+}
+
+/// 发布与资源协议共用的敏感文件识别；未命中不代表内容已经过秘密扫描。
+pub(crate) fn sensitive_package_file(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let stem = name.split('.').next().unwrap_or("");
+    matches!(stem, "credentials" | "secrets" | "secret" | "token" | "tokens" | "chat_keys" | "account_token")
+        || [".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3", ".log", ".pem", ".key", ".pfx", ".p12", ".env", ".xhpack", ".zip"]
+            .iter().any(|suffix| name.ends_with(suffix))
 }
 
 /// 扩展升级需保留的用户数据点文件（随扩展卸载可清除，升级时必须保留）。
@@ -835,6 +858,14 @@ mod tests {
         let unpack = tempfile::tempdir().unwrap();
         extract_zip(&std::fs::read(&out).unwrap(), unpack.path()).unwrap();
         assert!(find_manifest_dir(unpack.path()).is_ok());
+
+        for name in ["credentials.json", "history.sqlite", "debug.log", "private.pem"] {
+            let previous = std::fs::read(&out).unwrap();
+            std::fs::write(ext.join(name), "测试私有数据").unwrap();
+            assert!(pack_dir_to_archive(&ext, &out).is_err(), "{name} 不得进入发布包");
+            assert_eq!(std::fs::read(&out).unwrap(), previous, "失败不能覆盖已有产物");
+            std::fs::remove_file(ext.join(name)).unwrap();
+        }
     }
 
     #[test]

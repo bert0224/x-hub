@@ -8,6 +8,7 @@ mod chat_window;
 mod clipboard;
 mod commands;
 mod config;
+mod credentials;
 mod countdown_ticker;
 mod countdown_window;
 mod db;
@@ -295,8 +296,8 @@ pub fn run() {
             // 是**全局单例**，而扩展 iframe 与资产资源同源 ⇒ 放行数据根等于任何扩展都能直接
             // fetch 到用户数据库（xhub.db）、app.json 与日志，从而绕开桥 API 的权限系统。
             // 数据目录可被改到 %APPDATA% 之外（自定义目录 / U 盘便携），故必须动态放行。
-            const ASSET_SCOPE_SUBDIRS: [&str; 4] =
-                ["extensions", "icons", "wallpapers", "clipboard/images"];
+            const ASSET_SCOPE_SUBDIRS: [&str; 3] =
+                ["icons", "wallpapers", "clipboard/images"];
             for rel in ASSET_SCOPE_SUBDIRS {
                 let dir = crate::paths::data_root().join(rel);
                 // 目录必须先存在：allow_directory 会额外注册 canonicalize 后的模式变体，
@@ -338,7 +339,7 @@ pub fn run() {
                     log::warn!("扩展反向代理启动失败: {e}");
                     0
                 });
-            app.manage(proxy::ProxyState(proxy_port));
+            app.manage(proxy::ProxyState::new(proxy_port));
 
             tray::setup(app)?;
             shortcut::setup(app)?;

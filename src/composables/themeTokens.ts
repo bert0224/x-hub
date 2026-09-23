@@ -71,21 +71,28 @@ export function collectThemeTokens(): XHubThemeTokens {
 }
 
 /** 活动扩展 iframe 注册表：frame → 扩展 id（主题广播 + 扩展间事件路由共用） */
-const activeFrames = new Map<HTMLIFrameElement, string>()
+const activeFrames = new Map<HTMLIFrameElement, { extId: string; origin: string }>()
 
-export function registerExtensionFrame(el: HTMLIFrameElement | null, extId: string) {
-  if (el) activeFrames.set(el, extId)
+export function registerExtensionFrame(el: HTMLIFrameElement | null, extId: string, origin = '') {
+  if (el) activeFrames.set(el, { extId, origin })
 }
 
 export function unregisterExtensionFrame(el: HTMLIFrameElement | null) {
-  if (el) activeFrames.delete(el)
+  if (!el) return
+  activeFrames.delete(el)
+  for (const [id, call] of pendingCalls) {
+    if (call.fromFrame === el || call.targetFrame === el) {
+      clearTimeout(call.timer)
+      pendingCalls.delete(id)
+    }
+  }
 }
 
 /** 把当前主题广播给所有活动扩展 iframe（iframe 内桥脚本负责应用） */
 export function broadcastThemeToFrames() {
   const theme = collectThemeTokens()
-  for (const frame of activeFrames.keys()) {
-    frame.contentWindow?.postMessage({ __xhub: true, type: 'theme', theme }, '*')
+  for (const [frame, { origin }] of activeFrames) {
+    if (origin) frame.contentWindow?.postMessage({ __xhub: true, type: 'theme', theme }, origin)
   }
 }
 
@@ -94,11 +101,11 @@ export function broadcastThemeToFrames() {
  * 权限校验（events.emit 需 manifest 声明 `events` 权限）已在调用方经 Rust 完成。
  */
 export function broadcastExtensionEvent(fromExtId: string, event: string, payload: unknown) {
-  for (const [frame, extId] of activeFrames) {
-    if (extId === fromExtId) continue
+  for (const [frame, { extId, origin }] of activeFrames) {
+    if (extId === fromExtId || !origin) continue
     frame.contentWindow?.postMessage(
       { __xhub: true, type: 'event', event, payload, from: fromExtId },
-      '*',
+      origin,
     )
   }
 }
@@ -108,7 +115,11 @@ export function broadcastExtensionEvent(fromExtId: string, event: string, payloa
 // ---------------------------------------------------------------------------
 
 /** 待回传的跨扩展调用：requestId → 调用方 frame（模块级，跨 useExtensionFrame 实例共享） */
-const pendingCalls = new Map<number, HTMLIFrameElement>()
+let nextCallId = 0
+const pendingCalls = new Map<number, {
+  fromFrame: HTMLIFrameElement; targetFrame: HTMLIFrameElement; requestId: number
+  origin: string; timer: ReturnType<typeof setTimeout>
+}>()
 
 /** 把一次跨扩展调用路由到目标扩展 iframe；目标未打开则直接回错误 */
 export function routeExtensionCall(
@@ -118,12 +129,20 @@ export function routeExtensionCall(
   method: string,
   payload: unknown,
 ) {
-  for (const [frame, extId] of activeFrames) {
-    if (extId === targetId) {
-      pendingCalls.set(requestId, fromFrame)
+  const fromOrigin = activeFrames.get(fromFrame)?.origin
+  if (!fromOrigin) return
+  for (const [frame, { extId, origin }] of activeFrames) {
+    if (extId === targetId && origin) {
+      const id = ++nextCallId
+      const timer = setTimeout(() => {
+        pendingCalls.delete(id)
+        fromFrame.contentWindow?.postMessage({ __xhub: true, type: 'xhub-call-result', id: requestId,
+          ok: false, error: { message: '扩展调用超时' } }, fromOrigin)
+      }, 30_000)
+      pendingCalls.set(id, { fromFrame, targetFrame: frame, requestId, origin: fromOrigin, timer })
       frame.contentWindow?.postMessage(
-        { __xhub: true, type: 'xhub-call-req', id: requestId, method, payload },
-        '*',
+        { __xhub: true, type: 'xhub-call-req', id, method, payload },
+        origin,
       )
       return
     }
@@ -136,22 +155,24 @@ export function routeExtensionCall(
       ok: false,
       error: { message: `目标扩展「${targetId}」未打开，请先在扩展中心打开它再调用` },
     },
-    '*',
+    fromOrigin,
   )
 }
 
 /** 把目标扩展的调用结果回传给发起调用的 iframe */
 export function routeExtensionCallResult(
+  targetFrame: HTMLIFrameElement,
   requestId: number,
   ok: boolean,
   data: unknown,
   error: unknown,
 ) {
-  const fromFrame = pendingCalls.get(requestId)
-  if (!fromFrame) return
+  const call = pendingCalls.get(requestId)
+  if (!call || call.targetFrame !== targetFrame) return
   pendingCalls.delete(requestId)
-  fromFrame.contentWindow?.postMessage(
-    { __xhub: true, type: 'xhub-call-result', id: requestId, ok, data, error },
-    '*',
+  clearTimeout(call.timer)
+  call.fromFrame.contentWindow?.postMessage(
+    { __xhub: true, type: 'xhub-call-result', id: call.requestId, ok, data, error },
+    call.origin,
   )
 }

@@ -51,7 +51,7 @@ export function isImageIcon(icon: string | null): boolean {
 }
 
 export function iconSrc(icon: string): string {
-  if (/^https?:\/\//i.test(icon)) return icon
+  if (/^(https?:\/\/|xhub-ext:\/\/)/i.test(icon)) return icon
   return isTauri() ? convertFileSrc(icon) : ''
 }
 
